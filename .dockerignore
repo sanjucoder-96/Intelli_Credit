@@ -1,0 +1,22 @@
+# Keep docker build contexts small and hermetic (both Dockerfiles build from
+# the repo root — see deploy/*.Dockerfile headers).
+.git
+.github
+docs
+data
+pgdata
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.venv
+**/venv
+**/*.egg-info
+frontend/node_modules
+frontend/.next
+**/.env
+**/.env.local
+*.pdf
+.DS_Store
+Thumbs.db

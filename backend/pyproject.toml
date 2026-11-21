@@ -1,0 +1,135 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "intellicredit-backend"
+version = "0.2.0"
+description = "IntelliCredit AI backend — FastAPI + Celery + LangGraph modular monolith."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.111,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+    "sqlalchemy[asyncio]>=2.0,<3.0",
+    "asyncpg>=0.29,<1.0",
+    "alembic>=1.13,<2.0",
+    "pgvector>=0.2,<1.0",
+    "redis>=5,<6",
+    "celery>=5.3,<6.0",
+    "langgraph>=0.2,<1.0",
+    "langgraph-checkpoint-postgres>=1.0,<3.0",
+    "pydantic[email]>=2.7,<3.0",
+    "pydantic-settings>=2.2,<3.0",
+    "structlog>=24,<26",
+    "PyJWT>=2.8,<3.0",
+    "argon2-cffi>=23,<26",
+    "tenacity>=8.2,<10.0",
+    "prometheus-client>=0.20,<1.0",
+    "PyYAML>=6,<7",
+    "httpx>=0.27,<1.0",
+    "python-multipart>=0.0.9,<1.0",
+    # Document intelligence (Phase 4)
+    "puremagic>=1.20,<2.0",
+    "pypdfium2>=4.30,<5.0",
+    "pdfplumber>=0.11,<1.0",
+    # 1.2.x is the final line under this package name (successor renamed to
+    # `rapidocr`); API and bundled PP-OCR models are stable here.
+    "rapidocr-onnxruntime>=1.2,<2.0",
+    "fastembed>=0.3,<1.0",
+    "google-genai>=1.0,<2.0",
+    "openpyxl>=3.1,<4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.23,<1.0",
+    "ruff>=0.5,<1.0",
+    "mypy>=1.10,<2.0",
+    "import-linter>=2,<3",
+    "types-PyYAML>=6,<7",
+    "fpdf2>=2.7,<3.0",  # test-fixture PDF generation only
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+python_version = "3.12"
+# Alembic revision files (e.g. 0001_initial_schema.py) are not valid module
+# names; the migrations tree is executed by Alembic, not imported by the app.
+exclude = ["app/infrastructure/db/migrations/"]
+
+[[tool.mypy.overrides]]
+module = [
+    "celery.*",
+    "kombu.*",
+    "langgraph.*",
+    "pgvector.*",
+    "argon2.*",
+    "puremagic.*",
+    "pypdfium2.*",
+    "pdfplumber.*",
+    "rapidocr_onnxruntime.*",
+    "fastembed.*",
+    "fpdf.*",
+    "openpyxl.*",
+    "google.*",
+]
+ignore_missing_imports = true
+
+# Celery's task/signal decorators are untyped; the task shells stay typed.
+[[tool.mypy.overrides]]
+module = ["app.tasks.*"]
+disallow_untyped_decorators = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "integration: tests that require live Postgres/Redis (deselect with -m 'not integration')",
+]
+
+[tool.importlinter]
+root_package = "app"
+
+[[tool.importlinter.contracts]]
+name = "Clean architecture layers"
+type = "layers"
+layers = [
+    "app.api",
+    "app.tasks | app.seeds",
+    "app.workflows | app.ingestion",
+    "app.agents",
+    "app.analysis",
+    "app.infrastructure | app.docintel",
+    "app.application",
+    "app.domain",
+]
+
+# app.core is the shared kernel: importable by every layer, but it may only
+# depend on app.domain — never upward into adapters or delivery.
+[[tool.importlinter.contracts]]
+name = "Core is the shared kernel"
+type = "forbidden"
+source_modules = ["app.core"]
+forbidden_modules = [
+    "app.api",
+    "app.tasks",
+    "app.workflows | app.ingestion",
+    "app.agents",
+    "app.infrastructure",
+    "app.analysis",
+    "app.application",
+]

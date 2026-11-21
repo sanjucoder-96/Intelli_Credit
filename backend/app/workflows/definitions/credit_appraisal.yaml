@@ -1,0 +1,44 @@
+# Credit appraisal — workflow #1 (ARCHITECTURE §16, ADR-0008).
+#
+# Analyse (financial + research + fraud, in parallel) → HITL officer review
+# (interrupt) → deterministic scoring → recommendation narrative → CAM.
+# The officer's qualitative note is injected on resume and re-scored via the
+# scorecard's bounded qualitative notch — the LLM never sets a number.
+key: credit_appraisal
+version: 1
+entity_type: corporate
+
+nodes:
+  - name: financial_analysis
+    agent: financial_analysis
+  - name: research
+    agent: research
+  - name: fraud_detection
+    agent: fraud_detection
+  - name: human_review
+    agent: noop
+    after: [financial_analysis, research, fraud_detection]
+    interrupt: true
+  - name: risk_assessment
+    agent: risk_assessment
+    after: [human_review]
+  - name: recommendation
+    agent: recommendation
+    after: [risk_assessment]
+  - name: cam_generator
+    agent: cam_generator
+    after: [recommendation]
+
+agents:
+  research:
+    tools: [web_search]
+    budget: {max_tool_calls: 6, max_llm_calls: 4, max_cost_usd: 0.60}
+  recommendation:
+    tools: []
+
+dashboard:
+  - {type: risk_gauge}
+  - {type: table, id: five_cs}
+  - {type: timeline, id: cashflow}
+  - {type: network, id: promoter_graph}
+  - {type: evidence_chain}

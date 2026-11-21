@@ -1,0 +1,53 @@
+# ADR-0004: Celery + Redis for background work and scheduling
+
+**Status:** Accepted · **Date:** 2026-07-16 · **Phase:** 1 (Architecture)
+
+## Context
+
+Almost everything interesting in IntelliCredit happens off the request path: ingesting a 300-page scanned annual report (OCR, table extraction, embedding), executing a LangGraph agent run that takes minutes and pauses at a human-review `interrupt()`, training and scoring ML models, rendering CAM PDFs, and running scheduled workflows (portfolio monitoring, financial-health re-scans, news sweeps). These jobs need retries with backoff, rate limiting against Gemini quota, scheduling, and per-stage progress the UI can stream — none of which an HTTP request lifecycle can host. A multi-minute credit-appraisal run must survive a worker restart and a container redeploy.
+
+The constraints are the platform invariants: one developer, Windows 11, `docker compose up`, and a hard ceiling of two stateful services (PostgreSQL 17, Redis 7 — [ADR-0002](ADR-0002-postgres-as-the-everything-store.md)). Any queueing technology must ride on infrastructure that is already running. Under `docker compose` the worker runs in a Linux container (WSL2 backend), so Celery's default prefork pool is available and works normally — but the pool choice is still an architectural decision, not a deployment detail: graph tasks call `graph.ainvoke(...)` and need a clean per-task asyncio event-loop story, and the worker should behave identically if it is ever run natively on the Windows host during development.
+
+There is also a correctness force that shapes everything downstream: any broker we can afford delivers **at least once**. A redelivered task that blindly re-executes would double-write chunks, evidence rows, and findings — corrupting the append-only ledger the platform sells as its explainability story (§15.3 of [ARCHITECTURE.md](../ARCHITECTURE.md)). The orchestration design must make duplicate delivery harmless by construction, especially at the seam where Celery's at-least-once meets LangGraph's Postgres checkpoints.
+
+## Decision
+
+**Celery 5.x with Redis 7 as both broker and result backend.** The same `intellicredit-backend` image is deployed three ways: `api` (FastAPI), `worker` (`celery worker`), and `beat` (`celery beat`). Flower rides behind the optional `--profile ops` compose profile.
+
+- **Pool choice — threads/solo over prefork:** the worker runs with the threads pool (`-P threads`) or solo pool. Prefork is available in-container (the worker is a Linux container under the WSL2 backend), but threads/solo is chosen for a clean per-task asyncio event-loop story — graph tasks call `graph.ainvoke(...)` — and to keep behavior identical if the worker is ever run natively on the Windows host during development. CPU-heavy work (RapidOCR on ONNX Runtime, XGBoost/LightGBM inference) releases the GIL in native code, so threads are not a bottleneck for our workload. An early spike (Phase 2–3, before the first agent graph runs on a worker) must verify solo-pool behavior with a per-task asyncio event loop.
+- **Queue split so CPU work cannot starve agent graphs:** `agents` (workflow graph execution), `ingest` (network-bound ingestion stages — Gemini extraction, embedding), and `ocr` (CPU-heavy OCR/ML, run at lower concurrency). One worker container consumes all three locally; the split is declared per-task now so scaling out later is a compose change, not a refactor.
+- **Beat drives scheduled workflows:** portfolio monitoring, health re-scans, news sweeps, and PSI drift checks (§10) are beat entries that enqueue ordinary workflow-run tasks. Schedules are declared in code and versioned in git.
+- **Ingestion is a chain of ten small idempotent stages per document** (§7), not one monolithic task, checkpointed in a `document_stages` table (status, attempt, machine-readable error). Every stage: deterministic task id `{doc_id}:{stage}`, `acks_late=True`, `autoretry_for=(TransientError,)` with exponential backoff + jitter, per-stage retry budgets (5 for network-bound stages, 2 for CPU stages), and a first action of reading its checkpoint and **no-oping if `DONE`**. The checkpoint table doubles as the live pipeline-progress UI over SSE — reliability machinery and demo asset are the same rows.
+- **Idempotency at the Celery × LangGraph seam is a first-class rule:** a redelivered graph task resumes from the Postgres checkpoint (`ainvoke(None, thread_id=run_id)` — completed nodes never re-run); all derived writes (chunks, evidence, findings) use deterministic keys and upserts. At-least-once delivery must be provably harmless, and this is enforced by an integration test that kills a worker mid-run and asserts no duplicate rows.
+- **Result backend is for task plumbing only** (status, chord synchronization for per-page OCR fan-out). Domain state — run state, findings, checkpoints — lives exclusively in Postgres; nothing an analyst or auditor sees ever depends on a Redis result key.
+- **Broker transport options:** `visibility_timeout` is set above the longest expected agent run, because Redis redelivers any `acks_late` task that outlives it; the idempotency rules above make an early redelivery a no-op rather than a corruption.
+
+## Alternatives considered
+
+### RabbitMQ as the broker
+Celery's canonical broker, with genuinely better delivery semantics (publisher confirms, per-message acknowledgement without a visibility-timeout hack). Rejected because it is a third stateful service — a second broker *technology* to configure, monitor, back up, and debug on a solo developer's laptop — purchased to solve problems this system does not have. Our throughput is tens of tasks per minute, not thousands per second, and the correctness gap (redelivery edge cases) must be closed by idempotency anyway, since even RabbitMQ is at-least-once. Redis is already running as cache, rate limiter, and SSE pub/sub; the queue adds zero new boxes.
+
+### arq or dramatiq
+Lighter, more modern Redis-native task libraries; arq is async-first, which fits the codebase style. Rejected on capability and maturity: neither ships a beat-equivalent scheduler (scheduled portfolio monitoring would need a hand-rolled cron container), Flower has no counterpart (queue introspection during a live demo matters), and Celery's retry machinery — `acks_late`, `autoretry_for`, backoff with jitter, chords for per-page OCR fan-out — is a decade more battle-tested. The ingestion pipeline leans on exactly these primitives; rebuilding them on a minimalist library is negative simplification.
+
+### Postgres-backed queue (procrastinate et al.)
+Attractive on paper — it would appear to reduce the stateful count to one. In practice it removes nothing: Redis stays regardless for the LLM cache, the global rate limiter, and SSE pub/sub. It would also route every task heartbeat and poll through the same Postgres instance that already carries vectors, FTS, LangGraph checkpoints, and the evidence ledger — adding queue-polling load to the one component ADR-0002 already flags for contention tuning. A queue on the everything-store makes the everything-store riskier for no box saved.
+
+### FastAPI BackgroundTasks / running agents in-request
+BackgroundTasks executes inside the API process after the response; it dies with the worker process, has no retries, no persistence, no scheduling, and no visibility. Running agent graphs in-request is worse: multi-minute runs would pin HTTP connections, a uvicorn restart or deploy would kill every in-flight credit appraisal, and the HITL `interrupt()` — where a run pauses for hours until a credit officer responds — is structurally impossible inside a request lifecycle. Rejected outright; only truly fire-and-forget trivia (e.g. best-effort cache warm) may ever use BackgroundTasks.
+
+### One monolithic `process_document` task
+The obvious shape — one Celery task per document doing parse → OCR → extract → chunk → embed. Rejected because any transient Gemini failure on page 240 restarts all 300 pages, there is no partial progress to stream to the UI, retry budgets cannot differ between network-bound and CPU-bound work, and a human reclassification would re-run everything instead of just `extract_domain`. Ten checkpointed stages give per-stage retry and resume, and the checkpoint table is the progress UI for free.
+
+## Consequences
+
+**Positive.** Zero new services — the queue, cache, limiter, and pub/sub share the Redis already in the compose file. Long-running agent runs survive worker restarts via the LangGraph Postgres checkpoint, and ingestion survives them via `document_stages`; redelivery is a no-op by construction. Beat gives scheduled monitoring workflows without a cron sidecar. The stage checkpoint table serves triple duty: reliability, observability, and the live pipeline-progress demo. Queue names are declared from day one, so moving OCR to a dedicated worker host later is configuration.
+
+**Negative / accepted.** Redis-as-broker is the weakest link in the delivery chain: no publisher confirms, and messages in flight during a Redis crash can be lost — acceptable here because every enqueue is recoverable from Postgres state (a stuck `PENDING` stage or run is re-enqueueable from the UI), and we deliberately do not persist anything authoritative in the broker. The visibility-timeout mechanism means a very long task *will* be redelivered while still running unless the timeout is sized generously — we accept the coupling and lean on idempotency. The threads pool shares one GIL, so a pathological pure-Python CPU task could stall a worker; our CPU work is native-code (ONNX, boosted trees), and the `ocr` queue's lower concurrency bounds the blast radius. Celery's asyncio support remains second-class (no native async tasks), so each graph task manages its own event loop — a known wart, not a blocker.
+
+**Follow-up obligations.**
+- Phase 2–3 spike: threads vs solo pool with a per-task asyncio loop driving `graph.ainvoke` (in-container and native on the Windows host); record the verified pool in the compose file and this ADR's addendum.
+- Set and document `broker_transport_options.visibility_timeout` above the longest observed run; include a redelivery-during-execution test.
+- Integration test in the compose test profile: kill the worker mid-ingestion and mid-graph-run, restart, assert exactly-once effects (no duplicate chunks/evidence/findings).
+- Wire queue-depth and task-latency metrics into the `--profile ops` Grafana dashboards alongside Flower.
+- Beat schedules for portfolio monitoring and news sweeps land with the monitoring workflows in the later roadmap phases; drift-check (PSI) scheduling lands with the ML registry work (§10).

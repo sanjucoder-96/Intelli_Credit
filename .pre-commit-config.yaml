@@ -1,0 +1,30 @@
+# Pre-commit hooks for IntelliCredit.
+#   pip install pre-commit && pre-commit install
+# Revs are exact by pre-commit's design; bump with `pre-commit autoupdate`.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.9
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # Local mypy hook — OFF by default. mypy --strict needs the full backend dev
+  # environment (installed deps + pydantic plugin), which makes it slow and
+  # environment-sensitive as a commit hook; CI runs it authoritatively on every
+  # push/PR instead. Uncomment to opt in locally:
+  #
+  # - repo: local
+  #   hooks:
+  #     - id: mypy
+  #       name: mypy (backend, strict)
+  #       entry: bash -c 'cd backend && mypy app'
+  #       language: system
+  #       pass_filenames: false
+  #       files: ^backend/

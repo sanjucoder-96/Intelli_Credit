@@ -1,0 +1,21 @@
+# Test-only workflow definition exercising the loader + compiler.
+# Real workflow definitions live in app/workflows/definitions/ from Phase 5.
+key: wf_smoke
+version: 1
+entity_type: corporate
+nodes:
+  - name: gather
+    agent: noop
+  - name: summarize
+    agent: noop
+    after: [gather]
+agents:
+  noop:
+    tools: []
+    budget:
+      max_tool_calls: 2
+      max_llm_calls: 2
+      max_cost_usd: 0.01
+dashboard:
+  - type: narrative
+    id: summary

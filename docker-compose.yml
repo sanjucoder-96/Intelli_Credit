@@ -1,0 +1,151 @@
+# ------------------------------------------------------------------------------
+# IntelliCredit — local development stack.
+#
+#   cp .env.example .env            # once (compose interpolates ${...} from it)
+#   docker compose up -d --build    # core stack
+#   docker compose --profile ops up -d   # core + pgadmin + flower
+#
+# The api/worker/beat services share one image; inside the compose network they
+# override the host-local (127.0.0.1) connection URLs from .env with service
+# hostnames (postgres/redis) via the x-backend-env anchor below.
+# ------------------------------------------------------------------------------
+
+x-backend-image: &backend-image intellicredit-backend:dev
+
+x-backend-build: &backend-build
+  context: .
+  dockerfile: deploy/backend.Dockerfile
+
+x-backend-env: &backend-env
+  IC_DATABASE__URL: postgresql+asyncpg://${POSTGRES_USER:-intellicredit}:${POSTGRES_PASSWORD:-intellicredit}@postgres:5432/${POSTGRES_DB:-intellicredit}
+  # Non-superuser app role subject to row-level security (ADR-0013); created
+  # by `make seed` / app.infrastructure.db.rls.ensure_app_role. Dev-only creds.
+  IC_DATABASE__RLS_URL: postgresql+asyncpg://intellicredit_app:intellicredit_app@postgres:5432/${POSTGRES_DB:-intellicredit}
+  IC_REDIS__URL: redis://redis:6379/0
+  IC_CELERY__BROKER_URL: redis://redis:6379/1
+  IC_CELERY__RESULT_BACKEND: redis://redis:6379/2
+  # Shared blob volume (ADR-0016): originals, derived artifacts, page images.
+  IC_STORAGE__ROOT: /srv/storage
+  # fastembed model cache persists across container recreations (ADR-0007).
+  FASTEMBED_CACHE_PATH: /srv/storage/.fastembed
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-intellicredit}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-intellicredit}
+      POSTGRES_DB: ${POSTGRES_DB:-intellicredit}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # Exposed to the host so the backend can also be run outside docker
+      # against the same database (see .env.example host-local values).
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    image: *backend-image
+    build: *backend-build
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    env_file: .env
+    environment: *backend-env
+    volumes:
+      - appstorage:/srv/storage
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    image: *backend-image
+    build: *backend-build
+    command: celery -A app.tasks.celery_app worker -Q agents,ingest,ocr --pool=threads --concurrency=8 -l info
+    env_file: .env
+    environment: *backend-env
+    volumes:
+      - appstorage:/srv/storage
+    healthcheck:
+      # The image HEALTHCHECK curls the API port, which is meaningless in a
+      # worker container; a celery-inspect-based check can land in Phase 4.
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  beat:
+    image: *backend-image
+    build: *backend-build
+    # -s: the schedule shelve must live somewhere the non-root user can write.
+    command: celery -A app.tasks.celery_app beat -l info -s /tmp/celerybeat-schedule
+    env_file: .env
+    environment: *backend-env
+    healthcheck:
+      disable: true
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: deploy/frontend.Dockerfile
+      args:
+        # Inlined into the client bundle at build time; the browser calls the
+        # API on the host-published port, hence localhost (not a service name).
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+  # ---- ops profile: docker compose --profile ops up -d -------------------------
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    profiles: ["ops"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@intellicredit.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-change-me}
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  flower:
+    image: mher/flower:2.0
+    profiles: ["ops"]
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+      FLOWER_PORT: "5555"
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  appstorage:
