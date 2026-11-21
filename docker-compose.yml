@@ -1,9 +1,11 @@
 # ------------------------------------------------------------------------------
-# IntelliCredit — local development stack.
+# IntelliCredit — local / demo stack. One `docker compose up` produces a
+# complete, migrated, tenant-ready environment.
 #
-#   cp .env.example .env            # once (compose interpolates ${...} from it)
-#   docker compose up -d --build    # core stack
-#   docker compose --profile ops up -d   # core + pgadmin + flower
+#   cp .env.example .env                 # once (compose interpolates ${...} from it)
+#   docker compose up -d --build         # core stack (migrate runs automatically)
+#   make seed                            # demo tenant + login (analyst@/officer@/admin@)
+#   docker compose --profile ops up -d   # + pgadmin + flower
 #
 # The api/worker/beat services share one image; inside the compose network they
 # override the host-local (127.0.0.1) connection URLs from .env with service
@@ -18,20 +20,24 @@ x-backend-build: &backend-build
 
 x-backend-env: &backend-env
   IC_DATABASE__URL: postgresql+asyncpg://${POSTGRES_USER:-intellicredit}:${POSTGRES_PASSWORD:-intellicredit}@postgres:5432/${POSTGRES_DB:-intellicredit}
-  # Non-superuser app role subject to row-level security (ADR-0013); created
-  # by `make seed` / app.infrastructure.db.rls.ensure_app_role. Dev-only creds.
+  # Non-superuser app role subject to row-level security (ADR-0013); created by
+  # the one-shot `migrate` service (scripts.ensure_rls_role). Dev-only creds.
   IC_DATABASE__RLS_URL: postgresql+asyncpg://intellicredit_app:intellicredit_app@postgres:5432/${POSTGRES_DB:-intellicredit}
   IC_REDIS__URL: redis://redis:6379/0
   IC_CELERY__BROKER_URL: redis://redis:6379/1
   IC_CELERY__RESULT_BACKEND: redis://redis:6379/2
   # Shared blob volume (ADR-0016): originals, derived artifacts, page images.
   IC_STORAGE__ROOT: /srv/storage
+  # ML artifacts (champion PD model) on the shared volume — survive recreation
+  # and are visible to both api and worker (Phase 9 fix; was container-local).
+  IC_ML__ARTIFACT_DIR: /srv/storage/models
   # fastembed model cache persists across container recreations (ADR-0007).
   FASTEMBED_CACHE_PATH: /srv/storage/.fastembed
 
 services:
   postgres:
     image: pgvector/pgvector:pg17
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-intellicredit}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-intellicredit}
@@ -51,6 +57,12 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
+    # Persist the broker/results/cache so HITL-paused work and cached LLM
+    # responses survive a redis recreation (appendonly = durable).
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
     ports:
       - "6379:6379"
     healthcheck:
@@ -58,11 +70,27 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+      start_period: 5s
+
+  # One-shot: bring the schema to head AND ensure the RLS app role exists, then
+  # exit. api/worker/beat gate on its successful completion, so no service ever
+  # touches an unmigrated schema or a missing tenant role on a cold boot.
+  migrate:
+    image: *backend-image
+    build: *backend-build
+    command: sh -c "alembic upgrade head && python -m scripts.ensure_rls_role"
+    env_file: .env
+    environment: *backend-env
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   api:
     image: *backend-image
     build: *backend-build
-    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     env_file: .env
     environment: *backend-env
     volumes:
@@ -74,37 +102,49 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   worker:
     image: *backend-image
     build: *backend-build
+    restart: unless-stopped
     command: celery -A app.tasks.celery_app worker -Q agents,ingest,ocr --pool=threads --concurrency=8 -l info
     env_file: .env
     environment: *backend-env
     volumes:
       - appstorage:/srv/storage
     healthcheck:
-      # The image HEALTHCHECK curls the API port, which is meaningless in a
-      # worker container; a celery-inspect-based check can land in Phase 4.
-      disable: true
+      # A worker is healthy when Celery can ping a live worker over the broker.
+      test: ["CMD-SHELL", "celery -A app.tasks.celery_app inspect ping -t 5 >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   beat:
     image: *backend-image
     build: *backend-build
+    restart: unless-stopped
     # -s: the schedule shelve must live somewhere the non-root user can write.
     command: celery -A app.tasks.celery_app beat -l info -s /tmp/celerybeat-schedule
     env_file: .env
     environment: *backend-env
     healthcheck:
+      # Beat has no inspect endpoint; liveness is the process itself.
       disable: true
     depends_on:
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   frontend:
     build:
@@ -114,17 +154,26 @@ services:
         # Inlined into the client bundle at build time; the browser calls the
         # API on the host-published port, hence localhost (not a service name).
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    restart: unless-stopped
     environment:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     ports:
       - "3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/login >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
   # ---- ops profile: docker compose --profile ops up -d -------------------------
   pgadmin:
     image: dpage/pgadmin4:latest
     profiles: ["ops"]
+    restart: unless-stopped
     environment:
       PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@intellicredit.local}
       PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-change-me}
@@ -137,6 +186,7 @@ services:
   flower:
     image: mher/flower:2.0
     profiles: ["ops"]
+    restart: unless-stopped
     environment:
       CELERY_BROKER_URL: redis://redis:6379/1
       FLOWER_PORT: "5555"
@@ -149,3 +199,4 @@ services:
 volumes:
   pgdata:
   appstorage:
+  redisdata:
