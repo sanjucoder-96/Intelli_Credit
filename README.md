@@ -1,10 +1,22 @@
-# IntelliCredit AI
+<div align="center">
+
+# 🏦 IntelliCredit AI
 
 **An explainable AI platform for corporate credit intelligence.**
-It turns a pile of heterogeneous company evidence — GST returns, ITRs, bank
-statements, annual reports, contracts, legal notices — into a **citation-backed,
-quantitatively auditable credit decision** that a human can inspect, challenge,
-and sign off on.
+
+[![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![LangGraph](https://img.shields.io/badge/LangGraph-durable_workflows-1C3C3C)](https://langchain-ai.github.io/langgraph/)
+[![Gemini](https://img.shields.io/badge/Google_Gemini-extraction-8E75B2?logo=googlegemini&logoColor=white)](https://ai.google.dev/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-17_+_pgvector-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+[![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)](https://redis.io/)
+[![XGBoost](https://img.shields.io/badge/XGBoost-calibrated_PD-EB5E28)](https://xgboost.ai/)
+[![Next.js](https://img.shields.io/badge/Next.js-15-000?logo=nextdotjs&logoColor=white)](https://nextjs.org/)
+[![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+
+It turns a pile of heterogeneous company evidence — GST returns, ITRs, bank statements, annual reports, contracts, legal notices — into a **citation-backed, quantitatively auditable credit decision** that a human can inspect, challenge, and sign off on.
+
+</div>
 
 The one idea to remember: **the language model does not decide credit.** It reads
 documents, researches the web, and writes prose. Every *number* — the score, the
@@ -13,31 +25,21 @@ produced by deterministic code and a calibrated ML model, and every claim in the
 final memo links back to the exact page (and bounding box) or web snapshot it
 came from.
 
-```text
-                                 Ingestion
-   Documents ──▶ OCR / extraction ──▶ Evidence ledger (page + bbox, web snapshot)
-                                          │
-                                          ▼
-                                 credit_appraisal run
-   ┌───────────────────────────────────────────────────────────────────────┐
-   │  Financial analysis  ∥  Research  ∥  Fraud detection   (parallel)       │
-   │                          │                                              │
-   │                          ▼                                              │
-   │                   Human review  (HITL — the run pauses here)            │
-   │                          │                                              │
-   │                          ▼                                              │
-   │                   ML default risk  (calibrated PD + TreeSHAP)           │
-   │                          │                                              │
-   │                          ▼                                              │
-   │             Deterministic scorecard  →  policy grid                     │
-   │             (score · grade · limit · rate · risk premium)              │
-   │                          │                                              │
-   │                          ▼                                              │
-   │                   Recommendation narrative  (LLM, optional)             │
-   │                          │                                              │
-   │                          ▼                                              │
-   │                   CAM  (Credit Appraisal Memo + PDF)                    │
-   └───────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Docs["Documents"] --> OCR["OCR / extraction"]
+    OCR --> Ledger["Evidence ledger<br/>page + bbox · web snapshot"]
+    Ledger --> Run["credit_appraisal run"]
+    Run --> Fin["Financial analysis"]
+    Run --> Res["Research"]
+    Run --> Fraud["Fraud detection"]
+    Fin --> HITL["Human review<br/>(HITL — the run pauses here)"]
+    Res --> HITL
+    Fraud --> HITL
+    HITL --> ML["ML default risk<br/>calibrated PD + TreeSHAP"]
+    ML --> Score["Deterministic scorecard → policy grid<br/>score · grade · limit · rate · risk premium"]
+    Score --> Narr["Recommendation narrative<br/>(LLM, optional)"]
+    Narr --> CAM["CAM — Credit Appraisal Memo + PDF"]
 ```
 
 > The human review gate sits **before** ML and scoring on purpose: the credit
