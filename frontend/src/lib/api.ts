@@ -1,11 +1,11 @@
 /**
- * Minimal typed fetch wrapper for the IntelliCredit API.
+ * Typed fetch client for the IntelliCredit API.
  *
- * Phase-2 seam only: from Phase 3 the hand-written response interfaces below
- * are replaced by an openapi-typescript client generated from the FastAPI
- * OpenAPI document (ADR-0014 - contract drift becomes a compile error, not a
- * runtime surprise). Auth headers, refresh-token rotation, and the SSE
- * stream-ticket flow are added alongside the login screen in later phases.
+ * The backend is the single source of truth (ARCHITECTURE invariant): this
+ * client only transports JSON and attaches the bearer token. It never computes
+ * a score, limit, rate, or decision — those arrive from backend contracts.
+ * A 401 triggers one refresh-token rotation and a retry; a second failure
+ * clears the session (the auth store redirects to /login).
  */
 
 /** Shape of the backend error envelope (backend app/api/errors.py). */
@@ -31,10 +31,7 @@ export interface ReadyResponse {
   checks: Record<string, boolean>;
 }
 
-/**
- * Error thrown for any non-2xx API response (and for unparsable bodies).
- * Carries the backend envelope fields when the body followed the contract.
- */
+/** Error thrown for any non-2xx API response (and for unparsable bodies). */
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
@@ -57,48 +54,82 @@ export class ApiError extends Error {
   }
 }
 
-/** Base URL of the API; must be inlined at build time via NEXT_PUBLIC_*. */
+/** Base URL of the API; inlined at build time via NEXT_PUBLIC_*. */
 export function apiBaseUrl(): string {
   return process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 }
 
+// --- token plumbing -------------------------------------------------------
+// The auth store owns the tokens and registers callbacks here so this module
+// stays free of React/zustand imports (and is usable from server-safe code).
+let accessToken: string | null = null;
+let onRefresh: (() => Promise<string | null>) | null = null;
+let onAuthFailure: (() => void) | null = null;
+
+export function setAccessToken(token: string | null): void {
+  accessToken = token;
+}
+export function registerRefreshHandler(fn: (() => Promise<string | null>) | null): void {
+  onRefresh = fn;
+}
+export function registerAuthFailureHandler(fn: (() => void) | null): void {
+  onAuthFailure = fn;
+}
+
 function isErrorEnvelope(body: unknown): body is ApiErrorEnvelope {
-  if (typeof body !== "object" || body === null || !("error" in body)) {
-    return false;
-  }
+  if (typeof body !== "object" || body === null || !("error" in body)) return false;
   const err = (body as { error: unknown }).error;
   return typeof err === "object" && err !== null && "code" in err;
 }
 
-/**
- * GET `path` (e.g. "/api/v1/health") and parse the JSON body as `T`.
- * Non-2xx responses raise a typed {@link ApiError} built from the backend
- * error envelope when present, or a synthesized one otherwise.
- */
-export async function apiGet<T>(path: string): Promise<T> {
+interface RequestOptions {
+  method?: string;
+  body?: unknown;
+  /** Skip auth header (login/refresh). */
+  anonymous?: boolean;
+  /** Internal: prevents infinite refresh recursion. */
+  _isRetry?: boolean;
+  signal?: AbortSignal;
+}
+
+async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (opts.body !== undefined) headers["Content-Type"] = "application/json";
+  if (!opts.anonymous && accessToken) headers.Authorization = `Bearer ${accessToken}`;
+
   let response: Response;
   try {
     response = await fetch(`${apiBaseUrl()}${path}`, {
-      headers: { Accept: "application/json" },
+      method: opts.method ?? "GET",
+      headers,
+      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
       cache: "no-store",
+      signal: opts.signal,
     });
   } catch (cause) {
-    throw new ApiError(
-      0,
-      "network_error",
-      `API unreachable at ${apiBaseUrl()}${path}`,
-      { cause: String(cause) },
-    );
+    throw new ApiError(0, "network_error", `API unreachable at ${apiBaseUrl()}${path}`, {
+      cause: String(cause),
+    });
+  }
+
+  // 401 → attempt one refresh, then retry once.
+  if (response.status === 401 && !opts.anonymous && !opts._isRetry && onRefresh) {
+    const refreshed = await onRefresh();
+    if (refreshed) {
+      return request<T>(path, { ...opts, _isRetry: true });
+    }
+    onAuthFailure?.();
   }
 
   let body: unknown = null;
   try {
-    body = await response.json();
+    body = response.status === 204 ? null : await response.json();
   } catch {
     body = null;
   }
 
   if (!response.ok) {
+    if (response.status === 401 && !opts.anonymous) onAuthFailure?.();
     if (isErrorEnvelope(body)) {
       throw new ApiError(
         response.status,
@@ -117,4 +148,67 @@ export async function apiGet<T>(path: string): Promise<T> {
   }
 
   return body as T;
+}
+
+export function apiGet<T>(path: string, signal?: AbortSignal): Promise<T> {
+  return request<T>(path, { signal });
+}
+
+/** Fetch a binary response (e.g. a rendered PDF) with the bearer token. */
+export async function apiBlob(path: string): Promise<Blob> {
+  const headers: Record<string, string> = {};
+  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  const response = await fetch(`${apiBaseUrl()}${path}`, { headers, cache: "no-store" });
+  if (!response.ok) {
+    throw new ApiError(response.status, "http_error", `Download failed (${response.status})`);
+  }
+  return response.blob();
+}
+
+/** Multipart upload (FormData); the browser sets the multipart boundary. */
+export async function apiUpload<T>(path: string, formData: FormData): Promise<T> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl()}${path}`, {
+      method: "POST",
+      headers,
+      body: formData,
+      cache: "no-store",
+    });
+  } catch (cause) {
+    throw new ApiError(0, "network_error", `API unreachable at ${apiBaseUrl()}${path}`, {
+      cause: String(cause),
+    });
+  }
+  let body: unknown = null;
+  try {
+    body = response.status === 204 ? null : await response.json();
+  } catch {
+    body = null;
+  }
+  if (!response.ok) {
+    if (response.status === 401) onAuthFailure?.();
+    if (isErrorEnvelope(body)) {
+      throw new ApiError(
+        response.status,
+        body.error.code,
+        body.error.message,
+        body.error.details,
+        body.error.request_id,
+      );
+    }
+    throw new ApiError(response.status, "http_error", `Upload failed (${response.status})`);
+  }
+  return body as T;
+}
+export function apiPost<T>(path: string, body?: unknown, opts?: RequestOptions): Promise<T> {
+  return request<T>(path, { ...opts, method: "POST", body });
+}
+export function apiPatch<T>(path: string, body?: unknown): Promise<T> {
+  return request<T>(path, { method: "PATCH", body });
+}
+export function apiDelete<T>(path: string): Promise<T> {
+  return request<T>(path, { method: "DELETE" });
 }
