@@ -1,0 +1,134 @@
+{
+  "name": "pd_model",
+  "version": "1.0.0",
+  "algorithm": "xgboost",
+  "feature_names": [
+    "roa",
+    "net_margin",
+    "ebitda_margin",
+    "asset_turnover",
+    "current_ratio",
+    "quick_ratio",
+    "liabilities_to_assets",
+    "equity_to_assets",
+    "debt_to_equity",
+    "working_capital_to_assets",
+    "ebitda_to_liabilities",
+    "receivable_days",
+    "inventory_days",
+    "revenue_growth"
+  ],
+  "feature_schema_version": "1.0",
+  "metrics": {
+    "roc_auc": 0.8125,
+    "pr_auc": 0.3132,
+    "ks": 0.4905,
+    "brier": 0.03836,
+    "ece": 0.0034,
+    "threshold": 0.15,
+    "confusion": {
+      "tn": 7986,
+      "fp": 277,
+      "fn": 268,
+      "tp": 150
+    },
+    "n": 8681,
+    "positives": 418,
+    "base_rate": 0.04815,
+    "brier_uncalibrated": 0.1369,
+    "ece_uncalibrated": 0.2643,
+    "shap_importance": {
+      "quick_ratio": 0.65455,
+      "net_margin": 0.46184,
+      "revenue_growth": 0.36307,
+      "ebitda_margin": 0.20708,
+      "asset_turnover": 0.1916,
+      "roa": 0.17872,
+      "inventory_days": 0.15234,
+      "working_capital_to_assets": 0.15072,
+      "receivable_days": 0.15045,
+      "ebitda_to_liabilities": 0.13318,
+      "equity_to_assets": 0.12309,
+      "current_ratio": 0.10989,
+      "liabilities_to_assets": 0.06061,
+      "debt_to_equity": 0.041
+    }
+  },
+  "baseline_metrics": {
+    "lightgbm_challenger": {
+      "roc_auc": 0.8142,
+      "pr_auc": 0.3462,
+      "ks": 0.4916,
+      "brier": 0.13468,
+      "ece": 0.255,
+      "threshold": 0.72,
+      "confusion": {
+        "tn": 7943,
+        "fp": 320,
+        "fn": 253,
+        "tp": 165
+      },
+      "n": 8681,
+      "positives": 418,
+      "base_rate": 0.04815
+    },
+    "logistic_regression_baseline": {
+      "roc_auc": 0.7047,
+      "pr_auc": 0.1281,
+      "ks": 0.3406,
+      "brier": 0.23014,
+      "ece": 0.4285,
+      "threshold": 0.53,
+      "confusion": {
+        "tn": 7115,
+        "fp": 1148,
+        "fn": 254,
+        "tp": 164
+      },
+      "n": 8681,
+      "positives": 418,
+      "base_rate": 0.04815
+    }
+  },
+  "data_lineage": {
+    "dataset": "polish_uci_365",
+    "source_files": [
+      "1year.arff",
+      "2year.arff",
+      "3year.arff",
+      "4year.arff",
+      "5year.arff"
+    ],
+    "sha256": "d2717868fca1a0bf4eb9c779b4228467c0cf11df62ff8c3b16293a2b6dfc4a1b",
+    "n_rows": 43405,
+    "n_features": 14,
+    "positive_rate": 0.048174,
+    "data_origin": "real",
+    "horizons": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ]
+  },
+  "decision_threshold": 0.15,
+  "trained_at": "2026-08-21T05:50:43.832637+00:00",
+  "git_sha": "397b60b",
+  "data_origin": "real",
+  "non_production": false,
+  "notes": "Trained on the Polish Companies Bankruptcy public dataset (UCI #365). These are not Indian corporates; ratio-space distress signals (leverage, coverage, liquidity, profitability) transfer structurally, so the output is a RELATIVE default-risk factor re-normalized inside the deterministic scorecard, never an absolute Indian PD (ADR-0010).",
+  "params": {
+    "objective": "binary:logistic",
+    "eval_metric": "aucpr",
+    "max_depth": 4,
+    "eta": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 5.0,
+    "scale_pos_weight": 19.761584454409565,
+    "tree_method": "hist",
+    "seed": 20260821,
+    "best_iteration": 198
+  }
+}

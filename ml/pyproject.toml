@@ -7,8 +7,17 @@ name = "intellicredit-ml"
 version = "0.2.0"
 description = "IntelliCredit ML training pipelines — Phase-2 stub, pipelines land in Phase 6 (ADR-0010)."
 requires-python = ">=3.12"
+# NOTE: training also imports the backend's `app.analysis.features` /
+# `app.infrastructure.ml.artifact` (ADR-0010 "one schema for training and
+# inference"), so run the CLI in the backend venv with the backend on
+# PYTHONPATH — e.g. `PYTHONPATH=../backend python -m ml.cli train pd_model`.
 dependencies = [
     "typer>=0.12,<1",
+    "numpy>=2.0,<3",
+    "xgboost>=2.1,<3",
+    "lightgbm>=4.5,<5",
+    "scikit-learn>=1.5,<2",
+    "joblib>=1.4,<2",
 ]
 
 [tool.setuptools.packages.find]
