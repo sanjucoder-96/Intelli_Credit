@@ -43,3 +43,8 @@ data/synthetic/*
 # ---- OS / editor -----------------------------------------------------------------
 .DS_Store
 Thumbs.db
+
+# ---- Local runtime artefacts -------------------------------------------------
+.claude/
+backend/storage/cases/
+backend/storage/derived/
