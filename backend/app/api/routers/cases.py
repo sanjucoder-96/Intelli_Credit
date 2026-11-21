@@ -49,6 +49,7 @@ from app.infrastructure.redis.client import get_redis
 from app.infrastructure.storage.local import LocalFilesystemStorage
 from app.ingestion.events import case_channel, stage_event
 from app.ingestion.handlers import document_password_key
+from app.ingestion.pdf import render_page_png
 from app.ingestion.stages import get_embedder
 from app.tasks.ingest import enqueue_stage, start_document_pipeline
 
@@ -266,6 +267,41 @@ async def download_document(
     )
 
 
+@router.get(
+    "/{case_id}/documents/{document_id}/page/{page}.png",
+    dependencies=[Depends(require_permissions(Permission.CASE_READ))],
+)
+async def render_document_page(
+    case_id: UUID,
+    document_id: UUID,
+    page: int,
+    ctx: Annotated[TenantContext, Depends(get_tenant_context)],
+    session: Annotated[AsyncSession, Depends(get_tenant_db_session)],
+    storage: Annotated[LocalFilesystemStorage, Depends(get_storage)],
+) -> Response:
+    """Server-render one PDF page to PNG for the evidence highlight viewer.
+
+    Rendering server-side (pypdfium2) keeps the browser free of a heavy PDF
+    engine: the frontend overlays normalised bounding boxes on a plain image,
+    so the citation highlight is exact and works offline. Non-PDF originals
+    (already raster) stream through unchanged.
+    """
+    document = await DocumentRepository(session).get(ctx, document_id)
+    if document is None or document.loan_application_id != case_id:
+        raise NotFoundError("Document not found")
+    content = await storage.get(document.storage_key)
+    if document.media_type != "application/pdf":
+        return Response(content=content, media_type=document.media_type)
+    if page < 1 or (document.page_count is not None and page > document.page_count):
+        raise NotFoundError("Page out of range")
+    png = await asyncio.to_thread(render_page_png, content, page, dpi=150)
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
 @router.post(
     "/{case_id}/documents/{document_id}/password",
     status_code=202,
@@ -342,13 +378,22 @@ async def search_case(
     )
 
 
-@router.get("/{case_id}/events")
+@router.get(
+    "/{case_id}/events",
+    dependencies=[Depends(require_permissions(Permission.CASE_READ))],
+)
 async def case_events(
     case_id: UUID,
     request: Request,
     ctx: Annotated[TenantContext, Depends(get_tenant_context)],
 ) -> StreamingResponse:
     """SSE progress stream: stage snapshot first, then live pub/sub relay.
+
+    Authorization is uniform with the other case routes: a valid token
+    (``get_tenant_context``) + the ``CASE_READ`` permission + tenant-scoped
+    ownership (the ``LoanApplicationRepository.get(ctx, ...)`` below returns
+    None for a case the caller's org does not own, so possessing a case/run id
+    alone never grants a subscription).
 
     Reconnect semantics per ADR-0014: the snapshot IS the rehydrate (state
     lives in ``document_stages``); Redis pub/sub carries live deltas only.

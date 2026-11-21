@@ -14,14 +14,16 @@ without the HTTP stack.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from celery import Celery
-from celery.signals import setup_logging
+from celery.signals import before_task_publish, setup_logging, task_postrun, task_prerun
 from kombu import Queue
 
 from app.core.config import get_settings
 from app.core.logging import configure_logging
+from app.core.metrics import observe_celery_task
 
 
 def _build_celery() -> Celery:
@@ -69,3 +71,40 @@ celery_app = _build_celery()
 def _configure_celery_logging(**_kwargs: Any) -> None:
     """Route worker/beat logs through structlog instead of Celery's defaults."""
     configure_logging(get_settings().log)
+
+
+# --------------------------------------------------------------------------- #
+# Task observability (Phase 9): queue latency (enqueue→start), task duration,
+# and success/failure — for every task, in one place. Best-effort: a metrics
+# hiccup never affects task execution.
+# --------------------------------------------------------------------------- #
+_TASK_STARTS: dict[str, float] = {}
+
+
+@before_task_publish.connect
+def _stamp_enqueue_time(headers: dict[str, Any] | None = None, **_kwargs: Any) -> None:
+    """Stamp the publish time into the message headers so the worker can
+    measure how long the task waited in the queue."""
+    if headers is not None:
+        headers["ic_enqueued_at"] = time.time()
+
+
+@task_prerun.connect
+def _on_task_prerun(task_id: str | None = None, task: Any = None, **_kwargs: Any) -> None:
+    if task_id is not None:
+        _TASK_STARTS[task_id] = time.perf_counter()
+    enqueued_at = getattr(getattr(task, "request", None), "ic_enqueued_at", None)
+    if enqueued_at:
+        name = getattr(task, "name", "unknown")
+        observe_celery_task(name, "started", queue_latency_s=time.time() - float(enqueued_at))
+
+
+@task_postrun.connect
+def _on_task_postrun(
+    task_id: str | None = None, task: Any = None, state: str | None = None, **_kwargs: Any
+) -> None:
+    started = _TASK_STARTS.pop(task_id, None) if task_id is not None else None
+    name = getattr(task, "name", "unknown")
+    status = "success" if state == "SUCCESS" else "failure"
+    duration_s = (time.perf_counter() - started) if started is not None else 0.0
+    observe_celery_task(name, status, duration_s=duration_s)

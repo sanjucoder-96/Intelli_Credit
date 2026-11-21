@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from app.core.config import GeminiConfig
 from app.core.errors import AppError
 from app.core.logging import get_logger
+from app.core.metrics import observe_llm_call
 
 logger = get_logger("app.infrastructure.gemini")
 
@@ -154,5 +155,16 @@ class GeminiClient:
             tokens_in=tokens_in,
             tokens_out=tokens_out,
             latency_ms=latency_ms,
+        )
+        # A physical (live) API hit: cache/replay never reach here, so this is
+        # the single non-double-counting emit point for live LLM latency/cost.
+        observe_llm_call(
+            chosen_model,
+            status="ok",
+            mode="live",
+            duration_s=latency_ms / 1000.0,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=result.cost_usd,
         )
         return validated, result

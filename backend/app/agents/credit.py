@@ -10,6 +10,7 @@ registers all of them on the shared agent registry.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 from uuid import UUID
 
@@ -24,6 +25,7 @@ from app.agents.registry import agent_registry
 from app.agents.spec import AgentSpec, ModelPolicy, ReflectionPolicy, StepBudget
 from app.analysis.cam import CamFinding, CompanyProfile, assemble_cam, render_markdown
 from app.analysis.five_cs import derive_five_cs
+from app.analysis.ml_risk import assess_default_risk
 from app.analysis.ratios import FinancialRatios, compute_ratios, financial_health_score
 from app.analysis.scorecard import (
     QualitativeNote,
@@ -33,6 +35,7 @@ from app.analysis.scorecard import (
     evaluate_scorecard,
 )
 from app.core.logging import get_logger
+from app.core.metrics import observe_cam_generation
 from app.docintel.schemas import FinancialLineItems
 from app.domain.enums import ReportStatus
 from app.infrastructure.db.models import (
@@ -43,6 +46,7 @@ from app.infrastructure.db.models import (
     ScoreBreakdown,
     WorkflowExecution,
 )
+from app.infrastructure.ml.registry import load_champion_pd_model
 
 logger = get_logger("app.agents.credit")
 
@@ -80,6 +84,21 @@ class ResearchOutput(BaseModel):
     findings: list[str] = Field(default_factory=list)
     sources: list[str] = Field(default_factory=list)
     configured: bool = False
+
+
+class MlDefaultRiskOutput(BaseModel):
+    available: bool = False
+    pd: float | None = None
+    pd_raw: float | None = None
+    coverage: float = 0.0
+    model_name: str | None = None
+    model_version: str | None = None
+    algorithm: str | None = None
+    feature_schema_version: str | None = None
+    non_production: bool = False
+    top_risk_factors: list[dict[str, Any]] = Field(default_factory=list)
+    top_mitigants: list[dict[str, Any]] = Field(default_factory=list)
+    note: str = ""
 
 
 class RiskAssessmentOutput(BaseModel):
@@ -197,6 +216,61 @@ class FraudDetectionAgent(BaseAgent):
         )
 
 
+@agent_registry.register("ml_default_risk")
+class MlDefaultRiskAgent(BaseAgent):
+    """Calibrated PD from the Phase-6 model — a relative default-risk signal.
+
+    Assembles the canonical feature vector from the borrower's financials, runs
+    the champion PD model (loaded in-process from the ``ml_models`` registry),
+    and emits the calibrated PD plus structural SHAP reason codes. The model
+    never sets a score, limit, rate, or decision — the deterministic scorecard
+    consumes this PD as the ml_default_risk pillar's input (ADR-0009/0010,
+    invariants #2, #4). With no champion registered, or feature coverage below
+    the configured minimum, the result is ``available=False`` and the pillar
+    stays excluded — the coverage mechanism is preserved.
+    """
+
+    async def act(self, ctx: AgentContext, plan: Plan) -> BaseModel:
+        ctx.components.set("schema", 1.0)
+        ctx.components.set("validators", 1.0)
+        raw_fin = ctx.state.get("scratch", {}).get("financials")
+        financials = FinancialLineItems.model_validate(raw_fin) if raw_fin else None
+
+        model = None
+        settings = ctx.settings
+        if settings is not None and settings.ml.enabled and ctx.session_factory is not None:
+            async with ctx.session_factory() as session:
+                model = await load_champion_pd_model(session, settings)
+            ratio = ctx.tools.success_ratio() if ctx.tools is not None else None
+            if ratio is not None:
+                ctx.components.set("tool", ratio)
+
+        min_cov = settings.ml.min_feature_coverage if settings is not None else 0.6
+        result = assess_default_risk(financials, model, min_coverage=min_cov)
+        return MlDefaultRiskOutput(
+            available=result.available,
+            pd=result.pd,
+            pd_raw=result.pd_raw,
+            coverage=result.coverage,
+            model_name=result.model_name,
+            model_version=result.model_version,
+            algorithm=result.algorithm,
+            feature_schema_version=result.feature_schema_version,
+            non_production=result.non_production,
+            top_risk_factors=[rc.model_dump() for rc in result.top_risk_factors(3)],
+            top_mitigants=[rc.model_dump() for rc in result.top_mitigants(3)],
+            note=result.note,
+        )
+
+
+def _ml_pd_from_state(state: dict[str, Any]) -> float | None:
+    """Read the calibrated PD from the ml_default_risk finding, if available."""
+    ml_out = _finding_output(state, "ml_default_risk")
+    if ml_out.get("available") and ml_out.get("pd") is not None:
+        return float(ml_out["pd"])
+    return None
+
+
 @agent_registry.register("risk_assessment")
 class RiskAssessmentAgent(BaseAgent):
     """Deterministic scorecard + policy grid → grade/decision/limit/rate.
@@ -233,9 +307,13 @@ class RiskAssessmentAgent(BaseAgent):
             turnover=financials.revenue if financials else None,
             collateral_coverage=scratch.get("collateral_coverage"),
             tenor_years=scratch.get("tenor_years"),
+            ml_pd=_ml_pd_from_state(state),
         )
         result = evaluate_scorecard(credit_appraisal_scorecard(), inputs)
-        await self._persist(ctx, result)
+        # The ML default-risk finding (PD, calibration, model provenance, TreeSHAP
+        # reason codes) lives only in the checkpoint state; persist it alongside
+        # the assessment so read APIs can serve the explainability screen.
+        await self._persist(ctx, result, _finding_output(state, "ml_default_risk"))
         await ctx.trace.record(
             TraceEvent(
                 node=ctx.node,
@@ -261,7 +339,9 @@ class RiskAssessmentAgent(BaseAgent):
             interest_rate_pct=result.pricing.rate_pct,
         )
 
-    async def _persist(self, ctx: AgentContext, result: RiskResult) -> None:
+    async def _persist(
+        self, ctx: AgentContext, result: RiskResult, ml: dict[str, Any] | None = None
+    ) -> None:
         if ctx.session_factory is None or ctx.tenant is None:
             return
         execution_id = await _execution_id(ctx)
@@ -291,6 +371,7 @@ class RiskAssessmentAgent(BaseAgent):
                     "limit": result.limit.model_dump(mode="json"),
                     "pricing": result.pricing.model_dump(mode="json"),
                     "notes": result.notes,
+                    "ml": ml or {},
                 },
             )
             session.add(assessment)
@@ -409,6 +490,11 @@ class CamGeneratorAgent(BaseAgent):
             knockouts=state.get("scratch", {}).get("knockouts", []),
             financials=financials,
             turnover=financials.revenue if financials else None,
+            # Match RiskAssessmentAgent's inputs exactly so the CAM re-derives the
+            # SAME limit/rate as the persisted, authoritative RiskAssessment.
+            collateral_coverage=state.get("scratch", {}).get("collateral_coverage"),
+            tenor_years=state.get("scratch", {}).get("tenor_years"),
+            ml_pd=_ml_pd_from_state(state),
         )
         risk = evaluate_scorecard(credit_appraisal_scorecard(), inputs)
         five_cs = derive_five_cs(risk, ratios, inputs)
@@ -434,6 +520,7 @@ class CamGeneratorAgent(BaseAgent):
         if ctx.caller is not None:
             summary = await self._narrative(ctx, risk, profile) or summary
 
+        _cam_t0 = time.perf_counter()
         cam = assemble_cam(
             company=profile,
             risk=risk,
@@ -444,6 +531,7 @@ class CamGeneratorAgent(BaseAgent):
         )
         markdown = render_markdown(cam)
         report_id = await self._persist(ctx, cam.model_dump(mode="json"), markdown)
+        observe_cam_generation("ok" if report_id else "unpersisted", time.perf_counter() - _cam_t0)
         return CamOutput(
             grade=risk.grade,
             decision=risk.decision.value,

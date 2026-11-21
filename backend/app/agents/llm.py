@@ -33,6 +33,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.core.errors import AppError
 from app.core.logging import get_logger
+from app.core.metrics import observe_llm_call
 from app.infrastructure.gemini import (
     GeminiCallResult,
     GeminiClient,
@@ -45,6 +46,33 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 
 _CACHE_PREFIX = "llmcache:"
 _REPLAY_PREFIX = "llmreplay:"
+
+# HTTP status codes / provider signals that indicate a *transient* failure worth
+# retrying (overloaded model, rate limit, gateway timeout) — never a bad request
+# or a schema-validation error (those are the caller's repair loop's job).
+_TRANSIENT_CODES = {408, 429, 500, 502, 503, 504}
+_TRANSIENT_MARKERS = (
+    "unavailable",
+    "resource_exhausted",
+    "deadline",
+    "overloaded",
+    "try again",
+    "temporarily",
+    "high demand",
+)
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True for a retriable provider blip (503/429/…), False for real errors."""
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if isinstance(code, int) and code in _TRANSIENT_CODES:
+        return True
+    message = str(exc).lower()
+    if any(str(c) in message for c in _TRANSIENT_CODES):
+        return True
+    return any(marker in message for marker in _TRANSIENT_MARKERS)
+
+
 _CACHE_TTL_SECONDS = 3600
 
 
@@ -253,6 +281,8 @@ class LLMGateway:
         replay_store: ReplayStore | None = None,
         ledger: LedgerRecorder | None = None,
         limiter: TokenBucketLimiter | None = None,
+        max_transient_retries: int = 3,
+        transient_backoff_base: float = 0.6,
     ) -> None:
         self._gemini = gemini
         self._redis = redis
@@ -260,6 +290,8 @@ class LLMGateway:
         self._replay = replay_store
         self._ledger = ledger or _noop_ledger
         self._limiter = limiter or (TokenBucketLimiter(redis) if redis is not None else None)
+        self._max_transient_retries = max_transient_retries
+        self._transient_backoff_base = transient_backoff_base
 
     @property
     def mode(self) -> LLMMode:
@@ -284,11 +316,13 @@ class LLMGateway:
                     f"No recorded response for {request.purpose!r} ({key[:12]}…)"
                 )
             await self._ledger(served.call, request.purpose, None)
+            observe_llm_call(served.call.model, status="ok", mode="replay")
             return served
 
         cached = await self._from_cache(request, key)
         if cached is not None:
             await self._ledger(cached.call, request.purpose, None)
+            observe_llm_call(cached.call.model, status="ok", mode="cache")
             return cached
 
         if governor is not None and not governor.escalation_allowed() and model == self._gemini_pro:
@@ -297,19 +331,50 @@ class LLMGateway:
         if self._limiter is not None:
             await self._limiter.acquire()
 
-        try:
-            parsed, call = await self._gemini.generate_structured(
-                schema=request.schema_type,
-                prompt=request.prompt,
-                image_png=request.image_png,
-                model=model,
-                temperature=request.temperature,
-            )
-        except GeminiUnconfiguredError:
-            raise
-        except Exception as exc:
-            await self._ledger(GeminiCallResult(model=model), request.purpose, str(exc)[:500])
-            raise
+        # Transient provider failures (503 "high demand", 429) are retried with
+        # exponential backoff so a temporary blip does not fail the run. A
+        # non-transient error (schema validation, bad request) is re-raised
+        # immediately for the caller's repair loop.
+        attempt = 0
+        while True:
+            try:
+                parsed, call = await self._gemini.generate_structured(
+                    schema=request.schema_type,
+                    prompt=request.prompt,
+                    image_png=request.image_png,
+                    model=model,
+                    temperature=request.temperature,
+                )
+                break
+            except GeminiUnconfiguredError:
+                raise
+            except Exception as exc:
+                if _is_transient(exc) and attempt < self._max_transient_retries:
+                    delay = self._transient_backoff_base * (2**attempt)
+                    logger.warning(
+                        "llm_transient_retry",
+                        purpose=request.purpose,
+                        attempt=attempt + 1,
+                        delay=round(delay, 2),
+                        error=str(exc)[:160],
+                    )
+                    await asyncio.sleep(delay)
+                    attempt += 1
+                    continue
+                # Retries exhausted: last-resort fall back to a recorded response
+                # if one exists, tagged explicitly so the mode is never hidden.
+                if _is_transient(exc):
+                    fallback = await self._from_replay(request, key)
+                    if fallback is not None:
+                        logger.warning("llm_transient_fallback_replay", purpose=request.purpose)
+                        await self._ledger(
+                            fallback.call, request.purpose, "served_from_replay_fallback"
+                        )
+                        observe_llm_call(fallback.call.model, status="ok", mode="replay_fallback")
+                        return fallback
+                await self._ledger(GeminiCallResult(model=model), request.purpose, str(exc)[:500])
+                observe_llm_call(model, status="error", mode="live")
+                raise
 
         raw_text = parsed.model_dump_json()
         result = LLMResult(parsed=parsed, raw_text=raw_text, call=call)

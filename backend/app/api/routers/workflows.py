@@ -14,9 +14,12 @@ from typing import Annotated
 from uuid import UUID, uuid4
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analysis.cam import CamReport
+from app.analysis.cam_pdf import render_cam_pdf
 from app.api.providers import (
     get_tenant_context,
     get_tenant_db_session,
@@ -29,10 +32,13 @@ from app.api.schemas.workflows import (
     StartRunRequest,
     StartRunResponse,
 )
+from app.application.execution_mode import resolve_execution_mode
+from app.core.config import get_settings
 from app.core.context import TenantContext
 from app.core.errors import NotFoundError, ValidationFailedError
 from app.domain.enums import Permission, WorkflowExecutionStatus
 from app.infrastructure.db.models import (
+    LLMInteraction,
     LoanApplication,
     Report,
     RiskAssessment,
@@ -123,6 +129,19 @@ async def get_run(
     report = (
         await session.execute(sa.select(Report).where(Report.workflow_execution_id == execution.id))
     ).scalar_one_or_none()
+    # Truthful demo-reliability mode: a completed run that fell back to a
+    # recording (any ledger row tagged with an error, e.g. a transient-503
+    # replay fallback) or whose execution errored is DEGRADED, not LIVE.
+    degraded = execution.error is not None or bool(
+        await session.scalar(
+            sa.select(
+                sa.exists().where(
+                    LLMInteraction.workflow_execution_id == execution.id,
+                    LLMInteraction.error.isnot(None),
+                )
+            )
+        )
+    )
     return RunStatusResponse(
         run_id=run_id,
         workflow_key=await _workflow_key(session, execution),
@@ -134,6 +153,7 @@ async def get_run(
         error=execution.error,
         started_at=execution.started_at,
         finished_at=execution.finished_at,
+        execution_mode=resolve_execution_mode(get_settings().agent.llm_mode, degraded=degraded),
     )
 
 
@@ -201,4 +221,34 @@ async def get_report(
         decision=ir.get("decision"),
         markdown=(report.artifacts or {}).get("markdown", ""),
         ir=ir,
+    )
+
+
+@router.get(
+    "/runs/{run_id}/report/export",
+    dependencies=[Depends(require_permissions(Permission.REPORT_READ))],
+)
+async def export_report(
+    run_id: str,
+    session: Annotated[AsyncSession, Depends(get_tenant_db_session)],
+    format: Annotated[str, Query(pattern="^(pdf)$")] = "pdf",
+) -> Response:
+    """Render the CAM to a downloadable PDF from the persisted IR.
+
+    The renderer prints the IR verbatim — it never recomputes a score, limit,
+    rate, or decision (ADR-0009/0011). DOCX is a planned follow-up.
+    """
+    execution = await _load_execution(session, run_id)
+    report = (
+        await session.execute(sa.select(Report).where(Report.workflow_execution_id == execution.id))
+    ).scalar_one_or_none()
+    if report is None:
+        raise NotFoundError(f"No report for run '{run_id}' yet")
+    cam = CamReport.model_validate(report.ir or {})
+    pdf_bytes = render_cam_pdf(cam)
+    filename = f"CAM-{cam.company.legal_name.replace(' ', '-')}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

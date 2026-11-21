@@ -86,6 +86,28 @@ def bind_request_context(
         structlog.contextvars.bind_contextvars(user_id=str(user_id))
 
 
+def bind_run_context(
+    run_id: str,
+    *,
+    org_id: UUID | str | None = None,
+    case_id: UUID | str | None = None,
+    node: str | None = None,
+) -> None:
+    """Bind workflow-run correlation fields into structlog contextvars.
+
+    Called by the worker task bodies so every downstream log line (agent,
+    ingestion, LLM) carries tenant / case / run-id / node — the correlation
+    plane for the metrics, with no secrets. Non-blocking best-effort.
+    """
+    structlog.contextvars.bind_contextvars(run_id=run_id)
+    if org_id is not None:
+        structlog.contextvars.bind_contextvars(org_id=str(org_id))
+    if case_id is not None:
+        structlog.contextvars.bind_contextvars(case_id=str(case_id))
+    if node is not None:
+        structlog.contextvars.bind_contextvars(node=node)
+
+
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
     """Return a named structlog bound logger."""
     logger: structlog.stdlib.BoundLogger = structlog.get_logger(name)

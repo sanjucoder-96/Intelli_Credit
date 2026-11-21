@@ -1,11 +1,13 @@
 # Credit appraisal — workflow #1 (ARCHITECTURE §16, ADR-0008).
 #
 # Analyse (financial + research + fraud, in parallel) → HITL officer review
-# (interrupt) → deterministic scoring → recommendation narrative → CAM.
-# The officer's qualitative note is injected on resume and re-scored via the
-# scorecard's bounded qualitative notch — the LLM never sets a number.
+# (interrupt) → ML default-risk (calibrated PD) → deterministic scoring →
+# recommendation narrative → CAM. The officer's qualitative note is injected on
+# resume and re-scored via the scorecard's bounded qualitative notch; the PD
+# model feeds the ml_default_risk pillar as a relative signal — neither the LLM
+# nor the ML model ever sets a score, limit, rate, or decision (ADR-0009/0010).
 key: credit_appraisal
-version: 1
+version: 3
 entity_type: corporate
 
 nodes:
@@ -19,12 +21,19 @@ nodes:
     agent: noop
     after: [financial_analysis, research, fraud_detection]
     interrupt: true
+  - name: ml_default_risk
+    agent: ml_default_risk
+    after: [human_review]
   - name: risk_assessment
     agent: risk_assessment
-    after: [human_review]
+    after: [ml_default_risk]
   - name: recommendation
     agent: recommendation
     after: [risk_assessment]
+    # Narrative only — the decision/limit/rate/CAM never depend on it, so a
+    # transient LLM outage here parks the node (degraded) rather than failing
+    # the run. The CAM's executive summary degrades deterministically too.
+    required: false
   - name: cam_generator
     agent: cam_generator
     after: [recommendation]

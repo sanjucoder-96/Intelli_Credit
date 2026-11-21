@@ -31,7 +31,7 @@ _SEVERITY_SCORE = {
     "high": 40.0,
     "critical": 20.0,
 }
-_MISSING_ML_REASON = "ml_pd_pending_phase6"
+_MISSING_ML_REASON = "ml_default_risk_unavailable"
 
 
 class Normalizer(BaseModel):
@@ -84,6 +84,10 @@ class ScoreInputs(BaseModel):
     turnover: Decimal | None = None
     collateral_coverage: float | None = None
     tenor_years: float | None = None
+    # Calibrated probability of default from the Phase-6 PD model (ADR-0010).
+    # ``None`` when no champion is registered or feature coverage is too low, in
+    # which case the ml_default_risk pillar stays excluded and coverage drops.
+    ml_pd: float | None = None
 
 
 class FactorResult(BaseModel):
@@ -188,7 +192,11 @@ def _factor_raw(factor: FactorConfig, inputs: ScoreInputs) -> tuple[float | None
     if kind == "constant":
         return (factor.constant, None)
     if kind == "ml_pd":
-        return (None, _MISSING_ML_REASON)  # Phase-6 model; excluded until then
+        # Calibrated PD from the Phase-6 model (0..1); the factor's normalizer
+        # maps it to a 0-100 score. Absent → excluded (coverage reflects it).
+        if inputs.ml_pd is None:
+            return (None, _MISSING_ML_REASON)
+        return (inputs.ml_pd, None)
     return (None, "unknown_source")
 
 
@@ -265,7 +273,10 @@ def evaluate_scorecard(config: ScorecardConfig, inputs: ScoreInputs) -> RiskResu
 
     notes: list[str] = []
     if any(f.exclusion_reason == _MISSING_ML_REASON for f in breakdown):
-        notes.append("ML probability-of-default factor pending Phase 6; excluded from the score.")
+        notes.append(
+            "ML default-risk factor unavailable (no champion model or insufficient "
+            "feature coverage); excluded from the score."
+        )
     if coverage < 0.7:
         notes.append(f"Evidence coverage {coverage:.0%} below 70% — routed to REFER.")
 
@@ -303,11 +314,14 @@ def _apply_overlays(
             )
         )
 
+    fraud_ceiling: float | None = None
     if inputs.fraud_severity == "critical":
-        score = min(score, 45.0)
+        fraud_ceiling = 45.0
+        score = min(score, fraud_ceiling)
         log.append(OverlayApplication(rule_id="cap_critical_fraud", fired=True, effect="cap→45"))
     elif inputs.fraud_severity == "high":
-        score = min(score, 55.0)
+        fraud_ceiling = 55.0
+        score = min(score, fraud_ceiling)
         log.append(OverlayApplication(rule_id="cap_high_fraud", fired=True, effect="cap→55"))
 
     notch_total = sum(note.notch for note in inputs.qualitative_notes)
@@ -320,6 +334,15 @@ def _apply_overlays(
                 fired=True,
                 effect=f"{notch_total:+.1f}",
                 detail="; ".join(f"{n.label} ({n.notch:+.0f})" for n in inputs.qualitative_notes),
+            )
+        )
+    # The fraud cap is a HARD ceiling: a positive qualitative notch must not lift
+    # the score back above it (re-clamp after the notch).
+    if fraud_ceiling is not None and score > fraud_ceiling:
+        score = fraud_ceiling
+        log.append(
+            OverlayApplication(
+                rule_id="fraud_cap_reclamp", fired=True, effect=f"reclamp→{fraud_ceiling:.0f}"
             )
         )
     return score, log, forced
@@ -444,7 +467,28 @@ def credit_appraisal_scorecard() -> ScorecardConfig:
             PillarConfig(
                 pillar_id="ml_default_risk",
                 weight=0.20,
-                factors=[FactorConfig(factor_id="pd", weight=1.0, source="ml_pd")],
+                factors=[
+                    FactorConfig(
+                        factor_id="pd",
+                        weight=1.0,
+                        source="ml_pd",
+                        # Calibrated PD (0..1) → 0-100 score; lower PD is better.
+                        # Anchored around the model's ~5% base rate: a 1% PD maps
+                        # near the top, a 40%+ PD near the bottom.
+                        normalizer=Normalizer(
+                            higher_is_better=False,
+                            breakpoints=[
+                                (0.01, 95),
+                                (0.03, 85),
+                                (0.06, 70),
+                                (0.10, 55),
+                                (0.20, 38),
+                                (0.40, 20),
+                                (0.60, 8),
+                            ],
+                        ),
+                    )
+                ],
             ),
             PillarConfig(
                 pillar_id="external_intelligence",

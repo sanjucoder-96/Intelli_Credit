@@ -11,6 +11,7 @@ defaults — no fake AI.
 from __future__ import annotations
 
 import statistics
+import time
 from abc import ABC, abstractmethod
 from typing import final
 
@@ -19,6 +20,7 @@ from pydantic import BaseModel, Field
 from app.agents.context import AgentContext, TraceEvent
 from app.agents.results import AgentResult, ConfidenceReport, Critique, compute_confidence
 from app.agents.spec import AgentSpec
+from app.core.metrics import observe_agent_node
 
 
 class PlannedStep(BaseModel):
@@ -44,6 +46,7 @@ class BaseAgent(ABC):
     async def run(self, ctx: AgentContext) -> AgentResult:
         """Execute the full lifecycle and return a confidence-scored result."""
         seq = 0
+        _t0 = time.perf_counter()
 
         plan = await self.plan(ctx)
         await ctx.trace.record(
@@ -100,6 +103,7 @@ class BaseAgent(ABC):
                 },
             )
         )
+        observe_agent_node(self.spec.name, "ok", time.perf_counter() - _t0)
         return AgentResult(output=draft, confidence=confidence)
 
     async def plan(self, ctx: AgentContext) -> Plan:

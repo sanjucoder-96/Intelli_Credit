@@ -35,15 +35,53 @@ _KIND_MAP = {
     "error": AgentExecutionKind.ERROR,
 }
 
-_REDACT_KEYS = frozenset({"prompt", "api_key", "password", "token"})
+# Secret-bearing keys dropped from any trace payload, at ANY nesting depth
+# (§15.6). Matched case-insensitively so "API_KEY"/"Authorization" are caught.
+_REDACT_KEYS = frozenset(
+    {
+        "prompt",
+        "api_key",
+        "password",
+        "token",
+        "secret",
+        "authorization",
+        "access_token",
+        "refresh_token",
+        "jwt_secret",
+        "credentials",
+    }
+)
 
 
 def run_channel(run_id: str) -> str:
     return f"run:{run_id}:events"
 
 
+def _redact_value(value: Any) -> Any:
+    """Recursively drop secret-bearing keys inside dicts, lists, and tuples.
+
+    A shallow top-level drop is not enough: agent payloads nest (findings carry
+    sub-dicts, evidence carries lists), so a secret placed under a redacted key
+    at any depth must be removed. Non-container values pass through untouched.
+    """
+    if isinstance(value, dict):
+        return {
+            k: _redact_value(v)
+            for k, v in value.items()
+            if not (isinstance(k, str) and k.lower() in _REDACT_KEYS)
+        }
+    if isinstance(value, list):
+        return [_redact_value(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_value(v) for v in value)
+    return value
+
+
 def _redact(payload: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in payload.items() if k not in _REDACT_KEYS}
+    """Redact a trace payload recursively (drops secret keys at every depth)."""
+    redacted = _redact_value(payload)
+    assert isinstance(redacted, dict)
+    return redacted
 
 
 class DbTraceWriter:

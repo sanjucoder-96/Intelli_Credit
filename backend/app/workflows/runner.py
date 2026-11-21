@@ -12,6 +12,7 @@ are not duplicated.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -24,6 +25,7 @@ import app.agents.credit  # noqa: F401 — registers the credit-appraisal agents
 from app.agents.registry import AgentRegistry, agent_registry
 from app.core.errors import NotFoundError
 from app.core.logging import get_logger
+from app.core.metrics import observe_workflow
 from app.domain.enums import WorkflowExecutionStatus
 from app.infrastructure.db.models import WorkflowExecution
 from app.workflows.compiler import ContextFactory, compile_workflow
@@ -155,6 +157,7 @@ class WorkflowRunner:
         )
         config: Any = {"configurable": {"thread_id": run_id}}
         interrupts = {node.name for node in definition.nodes if node.interrupt}
+        _started = time.perf_counter()
         try:
             existing = await graph.aget_state(config)
             has_checkpoint = existing.created_at is not None
@@ -198,6 +201,7 @@ class WorkflowRunner:
                 )
                 await session.commit()
             logger.error("workflow_run_failed", run_id=run_id, error=str(exc))
+            observe_workflow(definition.key, "failed", time.perf_counter() - _started)
             raise
 
         snapshot = await graph.aget_state(config)
@@ -219,6 +223,7 @@ class WorkflowRunner:
             interrupted=interrupted,
             findings=len(state.get("findings", [])),
         )
+        observe_workflow(definition.key, status.value, time.perf_counter() - _started)
         return RunOutcome(
             run_id=run_id,
             execution_id=execution_id,

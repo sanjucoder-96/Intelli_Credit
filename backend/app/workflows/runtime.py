@@ -110,6 +110,7 @@ def build_runtime_bundle(
         mode=resolved_mode,
         replay_store=RedisReplayStore(redis) if redis is not None else None,
         ledger=ledger,
+        max_transient_retries=settings.agent.llm_max_retries,
     )
     storage = LocalFilesystemStorage(settings.storage.root)
     research = TavilyClient(settings.tavily, storage)

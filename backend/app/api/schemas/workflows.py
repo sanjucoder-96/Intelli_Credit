@@ -60,6 +60,10 @@ class RunStatusResponse(BaseModel):
     error: dict[str, Any] | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    # Demo-reliability signal: LIVE | REPLAY | DEGRADED (truthful about whether a
+    # run used the live provider, recorded fixtures, or a fallback — never a
+    # fabricated answer). See app.application.execution_mode.
+    execution_mode: str = "LIVE"
 
 
 class RunReportResponse(BaseModel):

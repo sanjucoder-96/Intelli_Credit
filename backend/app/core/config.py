@@ -121,6 +121,25 @@ class AgentConfig(BaseModel):
     llm_mode: Literal["live", "record", "replay"] = "live"
     run_cost_cap_usd: float = 2.0
     rate_limit_per_sec: float = 8.0
+    # Retries for transient provider failures (503 "high demand", 429) before a
+    # call gives up — keeps a demo robust to temporary Gemini unavailability.
+    llm_max_retries: int = 3
+
+
+class MlConfig(BaseModel):
+    """ML inference settings (ADR-0010).
+
+    The PD model is served in-process: the champion artifact is loaded from
+    ``artifact_dir`` at first use and cached. ``enabled=False`` (or no champion
+    registered, or feature coverage below ``min_feature_coverage``) keeps the
+    ml_default_risk pillar excluded, so the deterministic scorecard degrades
+    exactly as it did before Phase 6 — the coverage mechanism is preserved.
+    """
+
+    enabled: bool = True
+    artifact_dir: str = "./storage/models"
+    champion_model_name: str = "pd_model"
+    min_feature_coverage: float = 0.6
 
 
 class IngestConfig(BaseModel):
@@ -153,6 +172,7 @@ class Settings(BaseSettings):
     gemini: GeminiConfig = Field(default_factory=GeminiConfig)
     tavily: TavilyConfig = Field(default_factory=TavilyConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
+    ml: MlConfig = Field(default_factory=MlConfig)
     ingest: IngestConfig = Field(default_factory=IngestConfig)
 
     model_config = SettingsConfigDict(

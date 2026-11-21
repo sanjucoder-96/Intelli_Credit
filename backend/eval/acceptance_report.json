@@ -1,0 +1,150 @@
+{
+  "overall": "PASS",
+  "categories": [
+    {
+      "name": "Extraction accuracy",
+      "verdict": "PASS",
+      "detail": "5 passed"
+    },
+    {
+      "name": "Evidence provenance",
+      "verdict": "PASS",
+      "detail": "6 passed"
+    },
+    {
+      "name": "GST / bank analysis",
+      "verdict": "PASS",
+      "detail": "8 passed"
+    },
+    {
+      "name": "Research (safety+shape)",
+      "verdict": "PASS",
+      "detail": "5 passed"
+    },
+    {
+      "name": "Fraud / consistency",
+      "verdict": "PASS",
+      "detail": "8 passed"
+    },
+    {
+      "name": "ML risk (PD + SHAP)",
+      "verdict": "PASS",
+      "detail": "31 passed"
+    },
+    {
+      "name": "Deterministic decision",
+      "verdict": "PASS",
+      "detail": "26 passed"
+    },
+    {
+      "name": "Gemini resilience",
+      "verdict": "PASS",
+      "detail": "31 passed"
+    },
+    {
+      "name": "CAM consistency",
+      "verdict": "PASS",
+      "detail": "4 passed"
+    },
+    {
+      "name": "PDF generation",
+      "verdict": "PASS",
+      "detail": "3 passed"
+    },
+    {
+      "name": "Security checks",
+      "verdict": "PASS",
+      "detail": "10 passed"
+    },
+    {
+      "name": "Security hardening",
+      "verdict": "PASS",
+      "detail": "5 passed"
+    },
+    {
+      "name": "Prompt injection",
+      "verdict": "PASS",
+      "detail": "6 passed"
+    },
+    {
+      "name": "Observability metrics",
+      "verdict": "PASS",
+      "detail": "3 passed"
+    },
+    {
+      "name": "Extraction/research bench",
+      "verdict": "PASS",
+      "detail": "6 passed"
+    },
+    {
+      "name": "Demo reliability mode",
+      "verdict": "PASS",
+      "detail": "4 passed"
+    },
+    {
+      "name": "Performance baseline",
+      "verdict": "PASS",
+      "detail": "2 passed"
+    },
+    {
+      "name": "HITL reliability",
+      "verdict": "SKIP",
+      "detail": "needs IC_INTEGRATION_TESTS=1 + live Postgres/Redis"
+    },
+    {
+      "name": "Restart / resume",
+      "verdict": "SKIP",
+      "detail": "needs IC_INTEGRATION_TESTS=1 + live Postgres/Redis"
+    },
+    {
+      "name": "CAM cross-surface",
+      "verdict": "SKIP",
+      "detail": "needs IC_INTEGRATION_TESTS=1 + live Postgres/Redis"
+    },
+    {
+      "name": "Tenant isolation",
+      "verdict": "SKIP",
+      "detail": "needs IC_INTEGRATION_TESTS=1 + live Postgres/Redis"
+    }
+  ],
+  "measured": {
+    "extraction": {
+      "docs": 7,
+      "classification_accuracy": 1.0,
+      "field_precision": 1.0,
+      "field_recall": 1.0,
+      "numeric_accuracy": 1.0,
+      "page_accuracy": 1.0,
+      "unknown_fields": 2,
+      "unknown_kept": 2,
+      "fabrications": 0
+    },
+    "perf_ms": {
+      "extraction_gstr3b": {
+        "iterations": 100,
+        "p50_ms": 0.091,
+        "p95_ms": 0.107,
+        "max_ms": 0.19
+      },
+      "ratios_scorecard": {
+        "iterations": 100,
+        "p50_ms": 0.135,
+        "p95_ms": 0.297,
+        "max_ms": 0.421
+      },
+      "pd_feature_build": {
+        "iterations": 100,
+        "p50_ms": 0.036,
+        "p95_ms": 0.068,
+        "max_ms": 0.202
+      },
+      "cam_assemble_render": {
+        "iterations": 100,
+        "p50_ms": 0.218,
+        "p95_ms": 0.329,
+        "max_ms": 0.529
+      }
+    }
+  },
+  "live_services": false
+}

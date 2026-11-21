@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.application.ports import EmbeddingProviderPort, StoragePort
 from app.core.config import Settings, get_settings
 from app.core.logging import get_logger
+from app.core.metrics import observe_ingest_stage
 from app.domain.enums import DocumentStatus, IngestStage, StageStatus
 from app.infrastructure.db.engine import create_engine_and_factory
 from app.infrastructure.db.models import Document, DocumentStage
@@ -221,9 +222,15 @@ async def _finish(
         checkpoint.status = status
         checkpoint.error = error
         checkpoint.finished_at = datetime.now(UTC)
+        duration_s = (
+            (checkpoint.finished_at - checkpoint.started_at).total_seconds()
+            if checkpoint.started_at is not None
+            else None
+        )
         if document is not None and document_status is not None:
             document.status = document_status
         await session.commit()
+        observe_ingest_stage(stage.value, status.value, duration_s)
 
         await publish_event(
             context.redis,

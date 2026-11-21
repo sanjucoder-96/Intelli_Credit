@@ -87,6 +87,10 @@ module = [
     "fpdf.*",
     "openpyxl.*",
     "google.*",
+    "xgboost.*",
+    "lightgbm.*",
+    "joblib.*",
+    "sklearn.*",
 ]
 ignore_missing_imports = true
 

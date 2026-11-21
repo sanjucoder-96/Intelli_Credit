@@ -21,14 +21,14 @@ import asyncio
 import selectors
 import sys
 from collections.abc import Awaitable
-from typing import Any, TypeVar
+from typing import Any
 from uuid import UUID
 
 import sqlalchemy as sa
 
 from app.core.config import get_settings
 from app.core.context import TenantContext
-from app.core.logging import get_logger
+from app.core.logging import bind_run_context, get_logger
 from app.domain.enums import Role, WorkflowExecutionStatus
 from app.infrastructure.db.engine import get_session_factory
 from app.infrastructure.db.models import Workflow, WorkflowExecution
@@ -54,10 +54,8 @@ _TERMINAL = frozenset(
     }
 )
 
-T = TypeVar("T")
 
-
-def _run_async(coro: Awaitable[T]) -> T:
+def _run_async[T](coro: Awaitable[T]) -> T:
     """Run a coroutine on a SelectorEventLoop.
 
     The durable checkpointer uses psycopg, which requires a selector loop on
@@ -227,6 +225,9 @@ async def _resume(*, run_id: str, resume_state: dict[str, Any]) -> RunOutcome | 
 @celery_app.task(name="workflow.run", bind=True, acks_late=True)
 def run_workflow_task(self: Any, **kwargs: Any) -> dict[str, Any]:
     """Own a workflow run to its first pause or completion (idempotent)."""
+    bind_run_context(
+        str(kwargs.get("run_id", "")), org_id=kwargs.get("org_id"), case_id=kwargs.get("case_id")
+    )
     outcome = _run_async(_run(**kwargs))
     result = {
         "run_id": outcome.run_id,
@@ -241,6 +242,7 @@ def run_workflow_task(self: Any, **kwargs: Any) -> dict[str, Any]:
 @celery_app.task(name="workflow.resume", bind=True, acks_late=True)
 def resume_workflow_task(self: Any, **kwargs: Any) -> dict[str, Any]:
     """Continue a paused run after HITL input (idempotent; noop if terminal)."""
+    bind_run_context(str(kwargs.get("run_id", "")))
     outcome = _run_async(_resume(**kwargs))
     if outcome is None:
         return {"run_id": kwargs.get("run_id"), "status": "noop"}
