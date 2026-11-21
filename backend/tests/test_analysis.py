@@ -72,8 +72,8 @@ def test_strong_company_is_approved_with_limit_and_rate() -> None:
     assert 0.79 <= result.coverage <= 0.81  # ML pillar (0.20) honestly excluded
     assert result.limit.amount is not None and result.limit.binding_constraint is not None
     assert result.pricing.rate_pct is not None and result.pricing.rate_pct > 0
-    # The ML-pending note is surfaced, not hidden.
-    assert any("Phase 6" in note for note in result.notes)
+    # The ML-unavailable note is surfaced, not hidden (no champion in this test).
+    assert any("ML default-risk factor unavailable" in note for note in result.notes)
     # No number came from an LLM — the whole result is arithmetic.
     assert result.base_score > 0 and result.final_score > 0
 

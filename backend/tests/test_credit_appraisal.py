@@ -254,7 +254,7 @@ async def test_credit_appraisal_happy_path_with_hitl_and_persistence() -> None:
                 ).scalars()
             )
             assert len(breakdown) >= 5  # per-factor rows persisted
-            assert any(b.exclusion_reason == "ml_pd_pending_phase6" for b in breakdown)
+            assert any(b.exclusion_reason == "ml_default_risk_unavailable" for b in breakdown)
 
             report = (
                 await session.execute(

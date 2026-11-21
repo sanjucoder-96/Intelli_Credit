@@ -214,3 +214,58 @@ async def test_ledger_records_each_physical_call() -> None:
     gateway = LLMGateway(FakeGeminiClient(), mode=LLMMode.LIVE, ledger=ledger)
     await gateway.complete(_request(), "gemini-2.5-flash")
     assert recorded == [("gemini-2.5-flash", "assess", None)]
+
+
+class _TransientClient(FakeGeminiClient):
+    """Raises a transient (503-like) error for the first N calls, then succeeds."""
+
+    def __init__(self, *, transient_fails: int = 0, always: bool = False) -> None:
+        super().__init__()
+        self._transient_fails = transient_fails
+        self._always = always
+
+    async def generate_structured(self, **kwargs: Any) -> Any:
+        model = kwargs.get("model") or self._config.flash_model
+        self.calls.append((model, kwargs.get("prompt", "")))
+        if self._always or len(self.calls) <= self._transient_fails:
+            raise RuntimeError("503 UNAVAILABLE: the model is experiencing high demand")
+        parsed = kwargs["schema"].model_validate({"verdict": "approve", "score": 7})
+        return parsed, GeminiCallResult(model=model, cost_usd=0.001)
+
+
+async def test_gateway_retries_transient_then_succeeds() -> None:
+    client = _TransientClient(transient_fails=2)
+    gateway = LLMGateway(
+        client, mode=LLMMode.LIVE, max_transient_retries=3, transient_backoff_base=0.0
+    )
+    result = await gateway.complete(_request(), "gemini-2.5-flash")
+    assert isinstance(result.parsed, Answer)
+    assert len(client.calls) == 3  # 2 transient failures + 1 success
+
+
+async def test_gateway_raises_after_transient_retries_exhausted() -> None:
+    client = _TransientClient(always=True)
+    gateway = LLMGateway(
+        client, mode=LLMMode.LIVE, max_transient_retries=2, transient_backoff_base=0.0
+    )
+    with pytest.raises(RuntimeError):
+        await gateway.complete(_request(), "gemini-2.5-flash")
+    assert len(client.calls) == 3  # initial + 2 retries
+
+
+async def test_gateway_transient_falls_back_to_replay() -> None:
+    store = InMemoryReplayStore()
+    recorder = LLMGateway(FakeGeminiClient(), mode=LLMMode.RECORD, replay_store=store)
+    recorded = await recorder.complete(_request(), "gemini-2.5-flash")
+
+    client = _TransientClient(always=True)
+    gateway = LLMGateway(
+        client,
+        mode=LLMMode.LIVE,
+        replay_store=store,
+        max_transient_retries=1,
+        transient_backoff_base=0.0,
+    )
+    served = await gateway.complete(_request(), "gemini-2.5-flash")
+    assert served.raw_text == recorded.raw_text  # explicit replay fallback
+    assert len(client.calls) == 2  # initial + 1 retry, then fell back
